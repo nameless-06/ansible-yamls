@@ -22,3 +22,124 @@
           state : present
       - name : start ntp service
         service : name=ntpd state=started enabled=yes
+
+
+import subprocess
+from datetime import datetime, timedelta
+import prettytable
+import os
+
+# Function to parse license data
+def parse_license_data(output):
+    licenses = []
+    for line in output.strip().split("\n"):
+        parts = line.split(":")
+        if len(parts) < 5:
+            continue
+        
+        license_name = parts[0]
+        state = parts[1]
+        number = parts[2]
+        expiration_date = parts[3]
+        provider = parts[4]
+
+        # Map vendor names
+        if provider == "ctest":
+            provider = "ci_test"
+        elif provider == "atest":
+            provider = "ave_test"
+
+        # Parse expiration date
+        try:
+            exp_date = datetime.strptime(expiration_date, "%Y-%m-%d")
+        except ValueError:
+            continue
+
+        licenses.append({
+            "license_name": license_name,
+            "state": state,
+            "number": number,
+            "expiration_date": exp_date,
+            "provider": provider
+        })
+    return licenses
+
+# Function to categorize licenses
+def categorize_licenses(licenses):
+    today = datetime.now()
+    next_two_months = today + timedelta(days=60)
+
+    expiring_today = []
+    expiring_soon = []
+    already_expired = []
+
+    for lic in licenses:
+        if lic["expiration_date"] < today:
+            already_expired.append(lic)
+        elif lic["expiration_date"].date() == today.date():
+            expiring_today.append(lic)
+        elif lic["expiration_date"] <= next_two_months:
+            expiring_soon.append(lic)
+
+    return expiring_today, expiring_soon, already_expired
+
+# Function to create a table
+def create_table(title, licenses):
+    table = prettytable.PrettyTable()
+    table.field_names = ["Provider", "License Name", "State", "Expiration Date"]
+    table.title = title
+
+    for lic in licenses:
+        table.add_row([lic["provider"], lic["license_name"], lic["state"], lic["expiration_date"].strftime("%Y-%m-%d")])
+
+    return table
+
+# Main function
+def main():
+    # List of servers and ports
+    servers = ["server1", "server2", "server3"]
+    ports = ["2000", "3000", "4000"]
+    all_licenses = []
+    output_file = "/tmp/license_report.txt"
+
+    for server in servers:
+        for port in ports:
+            try:
+                # Run the license_stat command via SSH
+                command = f"ssh {server} 'license_stat {port}@{server}'"
+                result = subprocess.run(command, shell=True, text=True, capture_output=True)
+
+                if result.returncode == 0:
+                    # Parse the command output
+                    licenses = parse_license_data(result.stdout)
+                    all_licenses.extend(licenses)
+                else:
+                    print(f"Error running command on {server}:{port}: {result.stderr}")
+            except Exception as e:
+                print(f"Exception occurred while processing {server}:{port}: {e}")
+
+    # Sort licenses by expiration date
+    all_licenses.sort(key=lambda x: x["expiration_date"])
+
+    # Categorize licenses
+    expiring_today, expiring_soon, already_expired = categorize_licenses(all_licenses)
+
+    # Write the tables to a file
+    with open(output_file, "w") as file:
+        if expiring_today:
+            file.write(create_table("Licenses Expiring Today", expiring_today).get_string())
+            file.write("\n\n")
+        if expiring_soon:
+            file.write(create_table("Licenses Expiring in the Next Two Months", expiring_soon).get_string())
+            file.write("\n\n")
+        if already_expired:
+            file.write(create_table("Licenses Already Expired", already_expired).get_string())
+            file.write("\n\n")
+
+    # Send the file via email
+    recipient_email = "recipient@example.com"
+    subject = "License Expiration Report"
+    subprocess.run(f"mail -s '{subject}' {recipient_email} < {output_file}", shell=True)
+
+if __name__ == "__main__":
+    main()
