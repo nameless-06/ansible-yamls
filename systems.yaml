@@ -22,3 +22,197 @@
           state : present
       - name : start ntp service
         service : name=ntpd state=started enabled=yes
+
+
+
+
+
+
+
+import subprocess
+from datetime import datetime, timedelta
+import json
+import os
+import sys
+
+# Add the local directory to the Python path to find prettytable
+sys.path.insert(0, '/var/tmp/py-lic-script')
+
+# Import prettytable after adding the directory to sys.path
+import prettytable
+
+# Paths
+SERVERLIST_FILE = "/var/tmp/serverlist"
+TEMP_JSON_FILE = "/tmp/license_data.json"
+EXPIRING_JSON_FILE = "/tmp/licenses_expiring_soon.json"
+OUTPUT_TABLE_FILE = "/tmp/license_report.txt"
+
+# Function to parse license data
+def parse_license_data(output, port, server):
+    licenses = []
+    for line in output.strip().split("\n"):
+        parts = line.split()  # Split by spaces
+        if len(parts) < 5:
+            continue
+        
+        license_name = parts[0]
+        state = parts[1]
+        number = parts[2]
+        expiration_date = parts[3]
+        provider = parts[4]
+
+        # Map vendor names
+        if provider == "ctest":
+            provider = "ci_test"
+        elif provider == "atest":
+            provider = "ave_test"
+
+        # Parse expiration date
+        try:
+            exp_date = datetime.strptime(expiration_date, "%Y-%m-%d")
+        except ValueError:
+            continue
+
+        licenses.append({
+            "license_name": license_name,
+            "state": state,
+            "number": number,
+            "expiration_date": expiration_date,
+            "provider": provider,
+            "port": port,
+            "server": server,
+        })
+    return licenses
+
+# Function to run the command on a server
+def query_server(port, server):
+    try:
+        command = f"ssh {server} 'license_stat {port}@{server}'"
+        result = subprocess.run(command, shell=True, text=True, capture_output=True)
+
+        if result.returncode == 0:
+            return result.stdout
+        else:
+            print(f"Error running command on {server}:{port}: {result.stderr}")
+            return None
+    except Exception as e:
+        print(f"Exception occurred while querying {server}:{port}: {e}")
+        return None
+
+# Function to write licenses to a JSON file
+def append_to_json_file(data, file_path):
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "r") as file:
+                existing_data = json.load(file)
+        else:
+            existing_data = []
+
+        # Combine existing data with new data
+        existing_data.extend(data)
+
+        # Sort by expiration date
+        existing_data.sort(key=lambda x: datetime.strptime(x["expiration_date"], "%Y-%m-%d"))
+
+        # Write back to the JSON file
+        with open(file_path, "w") as file:
+            json.dump(existing_data, file, indent=4)
+    except Exception as e:
+        print(f"Error writing to JSON file: {e}")
+
+# Function to filter licenses expiring in the next 60 days
+def filter_expiring_licenses(json_file, output_file):
+    try:
+        today = datetime.now()
+        next_two_months = today + timedelta(days=60)
+
+        with open(json_file, "r") as file:
+            data = json.load(file)
+
+        # Filter licenses expiring in the next 60 days
+        expiring_licenses = [
+            lic for lic in data
+            if today <= datetime.strptime(lic["expiration_date"], "%Y-%m-%d") <= next_two_months
+        ]
+
+        # Write filtered licenses to another JSON file
+        with open(output_file, "w") as file:
+            json.dump(expiring_licenses, file, indent=4)
+
+        return expiring_licenses
+    except Exception as e:
+        print(f"Error filtering expiring licenses: {e}")
+        return []
+
+# Function to create a PrettyTable
+def create_pretty_table(licenses, title):
+    table = prettytable.PrettyTable()
+    table.field_names = ["Provider", "License Name", "State", "Expiration Date", "Port", "Server"]
+    table.title = title
+
+    for lic in licenses:
+        table.add_row([
+            lic["provider"],
+            lic["license_name"],
+            lic["state"],
+            lic["expiration_date"],
+            lic["port"],
+            lic["server"],
+        ])
+
+    return table
+
+# Main function
+def main():
+    all_licenses = []
+
+    # Process each server:port entry
+    try:
+        with open(SERVERLIST_FILE, "r") as file:
+            server_lines = file.readlines()
+
+        for line in server_lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Parse server and port
+            try:
+                port, server = line.split("@")
+            except ValueError:
+                print(f"Skipping malformed line: {line}")
+                continue
+
+            # Query the server
+            output = query_server(port, server)
+            if output:
+                # Parse and append data to JSON file
+                licenses = parse_license_data(output, port, server)
+                append_to_json_file(licenses, TEMP_JSON_FILE)
+    except FileNotFoundError:
+        print(f"Server list file {SERVERLIST_FILE} not found.")
+        return
+
+    # Filter licenses expiring in the next 60 days
+    expiring_licenses = filter_expiring_licenses(TEMP_JSON_FILE, EXPIRING_JSON_FILE)
+
+    # Generate PrettyTable
+    if expiring_licenses:
+        table = create_pretty_table(expiring_licenses, "Licenses Expiring in the Next 60 Days")
+
+        # Write PrettyTable to a text file
+        with open(OUTPUT_TABLE_FILE, "w") as file:
+            file.write(table.get_string())
+
+        # Email the report
+        recipient_email = "recipient@example.com"
+        subject = "License Expiration Report"
+        subprocess.run(
+            f"mail -s '{subject}' {recipient_email} < {OUTPUT_TABLE_FILE}",
+            shell=True,
+        )
+    else:
+        print("No licenses expiring in the next 60 days.")
+
+if __name__ == "__main__":
+    main()
