@@ -25,42 +25,4 @@
 
 
 
-import boto3
-import datetime
 
-cloudwatch = boto3.client('cloudwatch')
-
-end_time = datetime.datetime.utcnow()
-start_time = end_time - datetime.timedelta(days=1)
-
-fsx_id = "fs-aaa"
-
-response = cloudwatch.get_metric_data(
-    MetricDataQueries=[
-        {
-            'Id': 'fsx_utilization',
-            'MetricStat': {
-                'Metric': {
-                    'Namespace': 'AWS/FSx',
-                    'MetricName': 'StorageCapacityUtilization',
-                    'Dimensions': [{'Name': 'FileSystemId', 'Value': fsx_id}]
-                },
-                'Period': 3600,
-                'Stat': 'Average'
-            },
-            'ReturnData': True
-        }
-    ],
-    StartTime=start_time,
-    EndTime=end_time
-)
-
-# Print results
-for result in response['MetricDataResults']:
-    print(f"Metric: {result['Id']}")
-    for timestamp, value in zip(result['Timestamps'], result['Values']):
-        print(f"Timestamp: {timestamp}, Value: {value}%")
-
-    
-    
-            
