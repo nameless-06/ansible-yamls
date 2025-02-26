@@ -18,6 +18,155 @@
 </body>
 </html>
 
+
+
+
+import boto3
+import argparse
+from datetime import datetime, timedelta, timezone
+from prettytable import PrettyTable
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+# Thresholds
+UTILIZATION_THRESHOLD = 25  # Show FSx file systems with < 25% utilization
+AGE_THRESHOLD_DAYS = 7
+
+# Email Configuration
+SENDER_EMAIL = 'your_email@example.com'
+RECIPIENT_EMAIL = 'recipient@example.com'
+
+def get_fsx_filesystems(fsx_client):
+    """Get all FSx ONTAP file systems."""
+    filesystems = []
+    paginator = fsx_client.get_paginator('describe_file_systems')
+    for page in paginator.paginate():
+        filesystems.extend(page['FileSystems'])
+    return filesystems
+
+def get_cloudwatch_metric(cloudwatch_client, fs_id, metric_name, dimension_name):
+    """Fetch CloudWatch metric statistics (p50 median value)."""
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(days=7)
+
+    response = cloudwatch_client.get_metric_statistics(
+        Namespace='AWS/FSx',
+        MetricName=metric_name,
+        Dimensions=[{'Name': dimension_name, 'Value': fs_id}],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=86400,
+        ExtendedStatistics=['p50']
+    )
+
+    if response['Datapoints']:
+        value = response['Datapoints'][0]['p50']
+        print(f"{metric_name} for {fs_id}: {value}")  # Debugging output
+        return value
+    return None
+
+def get_volumes(fsx_client, cloudwatch_client, fs_id):
+    """Get all volumes of an FSx ONTAP file system and their utilization."""
+    volumes = []
+    paginator = fsx_client.get_paginator('describe_volumes')
+
+    for page in paginator.paginate(Filters=[{'Name': 'file-system-id', 'Values': [fs_id]}]):
+        for volume in page['Volumes']:
+            vol_id = volume['VolumeId']
+            vol_name = volume['Name']
+            utilization = get_cloudwatch_metric(cloudwatch_client, vol_id, 'StorageCapacityUtilization', 'VolumeId')
+
+            volumes.append({
+                'VolumeId': vol_id,
+                'Name': vol_name,
+                'Utilization': f"{utilization:.2f}%" if utilization is not None else "N/A"
+            })
+    return volumes
+
+def generate_report(fsx_client, cloudwatch_client):
+    """Generate FSx ONTAP utilization report."""
+    filesystems = get_fsx_filesystems(fsx_client)
+    report = []
+
+    for fs in filesystems:
+        if fs['FileSystemType'] == 'ONTAP':
+            fs_id = fs['FileSystemId']
+            creation_time = fs['CreationTime']
+            age = (datetime.now(timezone.utc) - creation_time).days
+
+            if age > AGE_THRESHOLD_DAYS:
+                utilization = get_cloudwatch_metric(cloudwatch_client, fs_id, 'StorageCapacityUtilization', 'FileSystemId')
+                capacity = get_cloudwatch_metric(cloudwatch_client, fs_id, 'StorageCapacity', 'FileSystemId')
+
+                if utilization is not None and utilization < UTILIZATION_THRESHOLD:
+                    volumes = get_volumes(fsx_client, cloudwatch_client, fs_id)  # Fetch volumes & utilization
+                    report.append({
+                        'FileSystemId': fs_id,
+                        'CreationTime': creation_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        'Capacity': f"{capacity:.2f} GB" if capacity else "N/A",
+                        'Utilization': f"{utilization:.2f}%",
+                        'Volumes': volumes
+                    })
+
+    return report
+
+def create_html_table(report):
+    """Generate HTML tables for each file system."""
+    html_content = "<h2>FSx ONTAP Utilization Report</h2>"
+
+    for fs in report:
+        html_content += f"<h3>FileSystem ID: {fs['FileSystemId']}</h3>"
+        html_content += f"<p><strong>Creation Time:</strong> {fs['CreationTime']}<br>"
+        html_content += f"<strong>Storage Capacity:</strong> {fs['Capacity']}<br>"
+        html_content += f"<strong>Utilization:</strong> {fs['Utilization']}</p>"
+
+        # Table for Volumes
+        table = PrettyTable()
+        table.field_names = ["Volume ID", "Volume Name", "Utilization"]
+
+        for vol in fs['Volumes']:
+            table.add_row([vol['VolumeId'], vol['Name'], vol['Utilization']])
+
+        html_content += table.get_html_string()
+        html_content += "<br>"
+
+    return html_content
+
+def send_email(html_content):
+    """Send the report as an HTML email using localhost SMTP."""
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = "FSx ONTAP Utilization Report"
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECIPIENT_EMAIL
+
+    part = MIMEText(html_content, 'html')
+    msg.attach(part)
+
+    with smtplib.SMTP('localhost') as server:
+        server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
+
+def main():
+    parser = argparse.ArgumentParser(description="FSx ONTAP Utilization Report")
+    parser.add_argument('--region', required=True, help="AWS region (e.g., us-east-1)")
+    args = parser.parse_args()
+    region = args.region
+
+    fsx_client = boto3.client('fsx', region_name=region)
+    cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+
+    report = generate_report(fsx_client, cloudwatch_client)
+    if report:
+        html_table = create_html_table(report)
+        send_email(html_table)
+        print("Report sent successfully.")
+    else:
+        print("No file systems below utilization threshold.")
+
+if __name__ == "__main__":
+    main()
+
+
         
 
             
